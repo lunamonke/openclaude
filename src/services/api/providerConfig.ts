@@ -220,6 +220,14 @@ export function isCodexAlias(model: string): boolean {
   return base in CODEX_ALIAS_MODELS
 }
 
+export function shouldUseCodexTransport(
+  model: string,
+  baseUrl: string | undefined,
+): boolean {
+  const explicitBaseUrl = asEnvUrl(baseUrl)
+  return isCodexBaseUrl(explicitBaseUrl) || (!explicitBaseUrl && isCodexAlias(model))
+}
+
 export function isLocalProviderUrl(baseUrl: string | undefined): boolean {
   if (!baseUrl) return false
   try {
@@ -308,13 +316,8 @@ export function resolveProviderRequest(options?: {
       isMistralMode ? (process.env.MISTRAL_BASE_URL ?? DEFAULT_MISTRAL_BASE_URL) : process.env.OPENAI_BASE_URL,
     ) ??
     asEnvUrl(process.env.OPENAI_API_BASE)
-  // Use Codex transport only when:
-  // - the base URL is explicitly the Codex endpoint, OR
-  // - the model is a Codex alias AND no custom base URL has been set
-  // A custom OPENAI_BASE_URL (e.g. Azure, OpenRouter) always wins over
-  // model-name-based Codex detection to prevent auth failures (#200, #203).
   const transport: ProviderTransport =
-    isCodexBaseUrl(rawBaseUrl) || (!rawBaseUrl && isCodexAlias(requestedModel))
+    shouldUseCodexTransport(requestedModel, rawBaseUrl)
       ? 'codex_responses'
       : 'chat_completions'
 
@@ -341,6 +344,30 @@ export function resolveProviderRequest(options?: {
       ).replace(/\/+$/, ''),
     reasoning,
   }
+}
+
+export function getAdditionalModelOptionsCacheScope(): string | null {
+  if (!isEnvTruthy(process.env.CLAUDE_CODE_USE_OPENAI)) {
+    if (!isEnvTruthy(process.env.CLAUDE_CODE_USE_GEMINI) &&
+        !isEnvTruthy(process.env.CLAUDE_CODE_USE_GITHUB) &&
+        !isEnvTruthy(process.env.CLAUDE_CODE_USE_BEDROCK) &&
+        !isEnvTruthy(process.env.CLAUDE_CODE_USE_VERTEX) &&
+        !isEnvTruthy(process.env.CLAUDE_CODE_USE_FOUNDRY)) {
+      return 'firstParty'
+    }
+    return null
+  }
+
+  const request = resolveProviderRequest()
+  if (request.transport !== 'chat_completions') {
+    return null
+  }
+
+  if (!isLocalProviderUrl(request.baseUrl)) {
+    return null
+  }
+
+  return `openai:${request.baseUrl.toLowerCase()}`
 }
 
 export function resolveCodexAuthPath(
