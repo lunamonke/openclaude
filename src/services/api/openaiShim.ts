@@ -42,6 +42,10 @@ import {
 } from './providerConfig.js'
 import { sanitizeSchemaForOpenAICompat } from '../../utils/schemaSanitizer.js'
 import { redactSecretValueForDisplay } from '../../utils/providerProfile.js'
+import {
+  normalizeToolArguments,
+  hasToolFieldMapping,
+} from './toolArgumentNormalization.js'
 
 type SecretValueSource = Partial<{
   OPENAI_API_KEY: string
@@ -481,6 +485,7 @@ interface OpenAIStreamChunk {
     delta: {
       role?: string
       content?: string | null
+      reasoning_content?: string | null
       tool_calls?: Array<{
         index: number
         id?: string
@@ -518,6 +523,30 @@ function convertChunkUsage(
   }
 }
 
+const JSON_REPAIR_SUFFIXES = [
+  '}', '"}', ']}', '"]}', '}}', '"}}', ']}}', '"]}}', '"]}]}', '}]}'
+]
+
+function repairPossiblyTruncatedObjectJson(raw: string): string | null {
+  try {
+    const parsed = JSON.parse(raw)
+    return parsed && typeof parsed === 'object' && !Array.isArray(parsed)
+      ? raw
+      : null
+  } catch {
+    for (const combo of JSON_REPAIR_SUFFIXES) {
+      try {
+        const repaired = raw + combo
+        const parsed = JSON.parse(repaired)
+        if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
+          return repaired
+        }
+      } catch {}
+    }
+    return null
+  }
+}
+
 /**
  * Async generator that transforms an OpenAI SSE stream into
  * Anthropic-format BetaRawMessageStreamEvent objects.
@@ -528,8 +557,19 @@ async function* openaiStreamToAnthropic(
 ): AsyncGenerator<AnthropicStreamEvent> {
   const messageId = makeMessageId()
   let contentBlockIndex = 0
-  const activeToolCalls = new Map<number, { id: string; name: string; index: number; jsonBuffer: string }>()
+  const activeToolCalls = new Map<
+    number,
+    {
+      id: string
+      name: string
+      index: number
+      jsonBuffer: string
+      normalizeAtStop: boolean
+    }
+  >()
   let hasEmittedContentStart = false
+  let hasEmittedThinkingStart = false
+  let hasClosedThinking = false
   let lastStopReason: 'tool_use' | 'max_tokens' | 'end_turn' | null = null
   let hasEmittedFinalUsage = false
   let hasProcessedFinishReason = false
@@ -586,9 +626,34 @@ async function* openaiStreamToAnthropic(
       for (const choice of chunk.choices ?? []) {
         const delta = choice.delta
 
+        // Reasoning models (e.g. GLM-5, DeepSeek) may stream chain-of-thought
+        // in `reasoning_content` before the actual reply appears in `content`.
+        // Emit reasoning as a thinking block and content as a text block.
+        if (delta.reasoning_content != null && delta.reasoning_content !== '') {
+          if (!hasEmittedThinkingStart) {
+            yield {
+              type: 'content_block_start',
+              index: contentBlockIndex,
+              content_block: { type: 'thinking', thinking: '' },
+            }
+            hasEmittedThinkingStart = true
+          }
+          yield {
+            type: 'content_block_delta',
+            index: contentBlockIndex,
+            delta: { type: 'thinking_delta', thinking: delta.reasoning_content },
+          }
+        }
+
         // Text content — use != null to distinguish absent field from empty string,
         // some providers send "" as first delta to signal streaming start
-        if (delta.content != null) {
+        if (delta.content != null && delta.content !== '') {
+          // Close thinking block if transitioning from reasoning to content
+          if (hasEmittedThinkingStart && !hasClosedThinking) {
+            yield { type: 'content_block_stop', index: contentBlockIndex }
+            contentBlockIndex++
+            hasClosedThinking = true
+          }
           if (!hasEmittedContentStart) {
             yield {
               type: 'content_block_start',
@@ -608,7 +673,12 @@ async function* openaiStreamToAnthropic(
         if (delta.tool_calls) {
           for (const tc of delta.tool_calls) {
             if (tc.id && tc.function?.name) {
-              // New tool call starting
+              // New tool call starting — close any open thinking block first
+              if (hasEmittedThinkingStart && !hasClosedThinking) {
+                yield { type: 'content_block_stop', index: contentBlockIndex }
+                contentBlockIndex++
+                hasClosedThinking = true
+              }
               if (hasEmittedContentStart) {
                 yield {
                   type: 'content_block_stop',
@@ -619,11 +689,14 @@ async function* openaiStreamToAnthropic(
               }
 
               const toolBlockIndex = contentBlockIndex
+              const initialArguments = tc.function.arguments ?? ''
+              const normalizeAtStop = hasToolFieldMapping(tc.function.name)
               activeToolCalls.set(tc.index, {
                 id: tc.id,
                 name: tc.function.name,
                 index: toolBlockIndex,
-                jsonBuffer: tc.function.arguments ?? '',
+                jsonBuffer: initialArguments,
+                normalizeAtStop,
               })
 
               yield {
@@ -647,7 +720,7 @@ async function* openaiStreamToAnthropic(
               contentBlockIndex++
 
               // Emit any initial arguments
-              if (tc.function.arguments) {
+              if (tc.function.arguments && !normalizeAtStop) {
                 yield {
                   type: 'content_block_delta',
                   index: toolBlockIndex,
@@ -664,6 +737,11 @@ async function* openaiStreamToAnthropic(
                 if (tc.function.arguments) {
                   active.jsonBuffer += tc.function.arguments
                 }
+
+                if (active.normalizeAtStop) {
+                  continue
+                }
+
                 yield {
                   type: 'content_block_delta',
                   index: active.index,
@@ -682,6 +760,12 @@ async function* openaiStreamToAnthropic(
         if (choice.finish_reason && !hasProcessedFinishReason) {
           hasProcessedFinishReason = true
 
+          // Close any open thinking block that wasn't closed by content transition
+          if (hasEmittedThinkingStart && !hasClosedThinking) {
+            yield { type: 'content_block_stop', index: contentBlockIndex }
+            contentBlockIndex++
+            hasClosedThinking = true
+          }
           // Close any open content blocks
           if (hasEmittedContentStart) {
             yield {
@@ -691,16 +775,44 @@ async function* openaiStreamToAnthropic(
           }
           // Close active tool calls
           for (const [, tc] of activeToolCalls) {
+            if (tc.normalizeAtStop) {
+              let partialJson: string
+              if (choice.finish_reason === 'length') {
+                // Truncated by max tokens — preserve raw buffer to avoid
+                // turning an incomplete tool call into an executable command
+                partialJson = tc.jsonBuffer
+              } else {
+                const repairedStructuredJson = repairPossiblyTruncatedObjectJson(
+                  tc.jsonBuffer,
+                )
+                if (repairedStructuredJson) {
+                  partialJson = repairedStructuredJson
+                } else {
+                  partialJson = JSON.stringify(
+                    normalizeToolArguments(tc.name, tc.jsonBuffer),
+                  )
+                }
+              }
+
+              yield {
+                type: 'content_block_delta',
+                index: tc.index,
+                delta: {
+                  type: 'input_json_delta',
+                  partial_json: partialJson,
+                },
+              }
+              yield { type: 'content_block_stop', index: tc.index }
+              continue
+            }
+
             let suffixToAdd = ''
             if (tc.jsonBuffer) {
               try {
                 JSON.parse(tc.jsonBuffer)
               } catch {
                 const str = tc.jsonBuffer.trimEnd()
-                const combinations = [
-                  '}', '"}', ']}', '"]}', '}}', '"}}', ']}}', '"]}}', '"]}]}', '}]}'
-                ]
-                for (const combo of combinations) {
+                for (const combo of JSON_REPAIR_SUFFIXES) {
                   try {
                     JSON.parse(str + combo)
                     suffixToAdd = combo
@@ -1092,6 +1204,7 @@ class OpenAIShimMessages {
             | string
             | null
             | Array<{ type?: string; text?: string }>
+          reasoning_content?: string | null
           tool_calls?: Array<{
             id: string
             function: { name: string; arguments: string }
@@ -1113,7 +1226,17 @@ class OpenAIShimMessages {
     const choice = data.choices?.[0]
     const content: Array<Record<string, unknown>> = []
 
-    const rawContent = choice?.message?.content
+    // Some reasoning models (e.g. GLM-5) put their reply in reasoning_content
+    // while content stays null — emit reasoning as a thinking block, then
+    // fall back to it for visible text if content is empty.
+    const reasoningText = choice?.message?.reasoning_content
+    if (typeof reasoningText === 'string' && reasoningText) {
+      content.push({ type: 'thinking', thinking: reasoningText })
+    }
+    const rawContent =
+      choice?.message?.content !== '' && choice?.message?.content != null
+        ? choice?.message?.content
+        : choice?.message?.reasoning_content
     if (typeof rawContent === 'string' && rawContent) {
       content.push({ type: 'text', text: rawContent })
     } else if (Array.isArray(rawContent) && rawContent.length > 0) {
@@ -1136,12 +1259,10 @@ class OpenAIShimMessages {
 
     if (choice?.message?.tool_calls) {
       for (const tc of choice.message.tool_calls) {
-        let input: unknown
-        try {
-          input = JSON.parse(tc.function.arguments)
-        } catch {
-          input = { raw: tc.function.arguments }
-        }
+        const input = normalizeToolArguments(
+          tc.function.name,
+          tc.function.arguments,
+        )
         content.push({
           type: 'tool_use',
           id: tc.id,
