@@ -128,6 +128,7 @@ type ProviderWizardDefaults = {
   openAIBaseUrl: string
   geminiModel: string
   mistralModel: string
+  mistralBaseUrl: string
 }
 
 function isEnvTruthy(value: string | undefined): boolean {
@@ -162,12 +163,16 @@ export function getProviderWizardDefaults(
   const safeMistralModel =
     sanitizeProviderConfigValue(processEnv.MISTRAL_MODEL, processEnv) ||
     DEFAULT_MISTRAL_MODEL
+  const safeMistralBaseUrl =
+    sanitizeProviderConfigValue(processEnv.MISTRAL_BASE_URL, processEnv) ||
+    DEFAULT_MISTRAL_BASE_URL
 
   return {
     openAIModel: safeOpenAIModel,
     openAIBaseUrl: safeOpenAIBaseUrl,
     geminiModel: safeGeminiModel,
     mistralModel: safeMistralModel,
+    mistralBaseUrl: safeMistralBaseUrl,
   }
 }
 
@@ -1210,7 +1215,9 @@ export function ProviderWizard({
           subtitle="Step 2 of 3"
           description={`Optionally enter a base URL. Leave blank for ${DEFAULT_MISTRAL_BASE_URL}.`}
           initialValue={
-            defaults.mistralModel === DEFAULT_MISTRAL_MODEL ? '' : ''
+            defaults.mistralBaseUrl === DEFAULT_MISTRAL_BASE_URL
+              ? ''
+              : defaults.mistralBaseUrl
           }
           placeholder={DEFAULT_MISTRAL_BASE_URL}
           allowEmpty
@@ -1246,7 +1253,7 @@ export function ProviderWizard({
               model: value.trim() || step.defaultModel,
               baseUrl: step.baseUrl,
               apiKey: step.apiKey,
-              processEnv: {},
+              processEnv: process.env,
             })
             if (env) {
               finishProfileSave(onDone, 'mistral', env)

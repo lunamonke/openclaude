@@ -94,9 +94,9 @@ function detectProvider(): { name: string; model: string; baseUrl: string; isLoc
   }
 
   if (useMistral) {
-    const model = process.env.MISTRAL_MODEL || 'devstral-latest';
-    const baseUrl = 'https://api.mistral.ai/v1';
-    return { name: 'Mistral', model, baseUrl, isLocal: false}
+    const model = process.env.MISTRAL_MODEL || 'devstral-latest'
+    const baseUrl = process.env.MISTRAL_BASE_URL || 'https://api.mistral.ai/v1'
+    return { name: 'Mistral', model, baseUrl, isLocal: false }
   }
 
   if (useGithub) {
