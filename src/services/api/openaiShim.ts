@@ -61,6 +61,7 @@ const GITHUB_API_VERSION = '2022-11-28'
 const GITHUB_429_MAX_RETRIES = 3
 const GITHUB_429_BASE_DELAY_SEC = 1
 const GITHUB_429_MAX_DELAY_SEC = 32
+const GEMINI_API_HOST = 'generativelanguage.googleapis.com'
 
 function isGithubModelsMode(): boolean {
   return isEnvTruthy(process.env.CLAUDE_CODE_USE_GITHUB)
@@ -68,6 +69,16 @@ function isGithubModelsMode(): boolean {
 
 function isMistralMode(): boolean {
     return isEnvTruthy(process.env.CLAUDE_CODE_USE_MISTRAL)
+}
+
+function hasGeminiApiHost(baseUrl: string | undefined): boolean {
+  if (!baseUrl) return false
+
+  try {
+    return new URL(baseUrl).hostname.toLowerCase() === GEMINI_API_HOST
+  } catch {
+    return false
+  }
 }
 
 function formatRetryAfterHint(response: Response): string {
@@ -209,8 +220,7 @@ function convertContentBlocks(
 function isGeminiMode(): boolean {
   return (
     isEnvTruthy(process.env.CLAUDE_CODE_USE_GEMINI) ||
-    (process.env.OPENAI_BASE_URL?.includes('generativelanguage.googleapis.com') ??
-      false)
+    hasGeminiApiHost(process.env.OPENAI_BASE_URL)
   )
 }
 
