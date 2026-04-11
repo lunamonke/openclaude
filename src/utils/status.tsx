@@ -408,7 +408,7 @@ export function buildAPIProviderProperties(): Property[] {
     if (mistralModel) {
       properties.push({
         label: 'Model',
-        value: redactSecretValueForDisplay(mistralModel, process.env) ?? mistralBaseUrl
+        value: redactSecretValueForDisplay(mistralModel, process.env) ?? mistralModel
       })
     }
   }

@@ -126,7 +126,7 @@ function currentBaseUrl(): string {
     return process.env.GEMINI_BASE_URL ?? GEMINI_DEFAULT_BASE_URL
   }
   if (isTruthy(process.env.CLAUDE_CODE_USE_MISTRAL)) {
-    return process.env.MISTRAL_BASE_URL ?? process.env.MISTRAL_DEFAULT_BASE_URL
+    return process.env.MISTRAL_BASE_URL ?? MISTRAL_DEFAULT_BASE_URL
   }
   if (isTruthy(process.env.CLAUDE_CODE_USE_GITHUB)) {
     return process.env.OPENAI_BASE_URL ?? GITHUB_COPILOT_BASE
